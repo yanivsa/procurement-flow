@@ -1,10 +1,16 @@
 export interface Env {
   PROCUREMENT_DB: D1Database;
   PROCUREMENT_FILES_BUCKET: R2Bucket;
+  ADMIN_TOKEN?: string;
 }
 
 // Increment this by 0.1 on each published change to surface version on the UI.
 const APP_VERSION = "0.2";
+
+// Basic in-memory rate limiter per instance (best-effort only).
+const rateWindowMs = 60_000;
+const rateLimit = 120;
+const rateBuckets = new Map<string, { count: number; reset: number }>();
 
 const landingPage = `<!doctype html>
 <html lang="he" dir="rtl">
@@ -483,6 +489,11 @@ const landingPage = `<!doctype html>
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const clientId = getClientId(request, url);
+
+    if (isRateLimited(clientId)) {
+      return new Response("Too many requests", { status: 429 });
+    }
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/form")) {
       return new Response(landingPage, {
@@ -499,6 +510,9 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/submit") {
+      if (!passesCsrf(request, url)) {
+        return new Response("CSRF validation failed", { status: 403 });
+      }
       return handleRequestSubmission(request, env);
     }
 
@@ -613,7 +627,7 @@ async function handleRequestSubmission(request: Request, env: Env): Promise<Resp
       : null;
     const signatureKey = await storeSingleFile(env, requestId, signatureFile, "signature");
 
-    await env.PROCUREMENT_DB.prepare(
+    const insertResult = await env.PROCUREMENT_DB.prepare(
       `
       INSERT INTO Requests (
         department,
@@ -682,6 +696,24 @@ async function handleRequestSubmission(request: Request, env: Env): Promise<Resp
         "pending",
       )
       .run();
+
+    const requestDbId = (insertResult.meta as { last_row_id?: number }).last_row_id ?? null;
+
+    // Store attachment metadata for future auditing/serving
+    if (requestDbId !== null) {
+      await storeAttachmentMeta(env, requestDbId, "spec", specFile.name || "spec" + requestId, specFileUrl);
+      if (engineeringApprovalFile && engineeringFileUrl) {
+        await storeAttachmentMeta(
+          env,
+          requestDbId,
+          "engineering",
+          engineeringApprovalFile.name || "engineering" + requestId,
+          engineeringFileUrl,
+        );
+      }
+      await storeAttachmentMeta(env, requestDbId, "signature", signatureFile.name || "signature" + requestId, signatureKey);
+      await logStatusChange(env, requestDbId, null, "pending", "auto-set on submission");
+    }
 
     return jsonResponse(
       {
@@ -771,10 +803,73 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#039;");
 }
 
+function getClientId(request: Request, url: URL): string {
+  return request.headers.get("cf-connecting-ip") || url.hostname || "unknown";
+}
+
+function isRateLimited(id: string): boolean {
+  const now = Date.now();
+  const entry = rateBuckets.get(id) || { count: 0, reset: now + rateWindowMs };
+  if (now > entry.reset) {
+    entry.count = 0;
+    entry.reset = now + rateWindowMs;
+  }
+  entry.count += 1;
+  rateBuckets.set(id, entry);
+  return entry.count > rateLimit;
+}
+
+function passesCsrf(request: Request, url: URL): boolean {
+  const origin = request.headers.get("origin");
+  if (origin && safeHost(origin) !== url.host) return false;
+  const referer = request.headers.get("referer");
+  if (referer && safeHost(referer) !== url.host) return false;
+  return true;
+}
+
+function safeHost(maybeUrl: string): string | null {
+  try {
+    return new URL(maybeUrl).host;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function storeAttachmentMeta(
+  env: Env,
+  requestId: number,
+  kind: string,
+  filename: string,
+  storageKey: string,
+): Promise<void> {
+  await env.PROCUREMENT_DB.prepare(
+    `INSERT INTO attachments (request_id, kind, filename, storage_key, uploaded_at)
+     VALUES (?1, ?2, ?3, ?4, datetime('now'));`,
+  )
+    .bind(requestId, kind, filename, storageKey)
+    .run();
+}
+
+async function logStatusChange(
+  env: Env,
+  requestId: number,
+  fromStatus: string | null,
+  toStatus: string,
+  note: string | null,
+): Promise<void> {
+  await env.PROCUREMENT_DB.prepare(
+    `INSERT INTO status_log (request_id, from_status, to_status, note, created_at)
+     VALUES (?1, ?2, ?3, ?4, datetime('now'));`,
+  )
+    .bind(requestId, fromStatus, toStatus, note)
+    .run();
+}
+
 async function handleAdminList(env: Env, url: URL): Promise<Response> {
   // TODO: replace with proper auth (e.g., Cloudflare Access/JWT/mTLS). Simple token check for now.
   const adminToken = url.searchParams.get("adminToken");
-  if (!adminToken || adminToken !== "demo-admin-token") {
+  const expected = env.ADMIN_TOKEN || "demo-admin-token";
+  if (!adminToken || adminToken !== expected) {
     return new Response("גישה נדחתה (נדרש טוקן ניהול).", { status: 403 });
   }
 
