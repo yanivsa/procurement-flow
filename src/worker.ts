@@ -2,6 +2,9 @@ export interface Env {
   PROCUREMENT_DB: D1Database;
   PROCUREMENT_FILES_BUCKET: R2Bucket;
   ADMIN_TOKEN?: string;
+  RESEND_API_KEY?: string;
+  NOTIFY_EMAIL?: string;
+  FROM_EMAIL?: string;
 }
 
 // Increment this by 0.1 on each published change to surface version on the UI.
@@ -715,6 +718,8 @@ async function handleRequestSubmission(request: Request, env: Env): Promise<Resp
       await logStatusChange(env, requestDbId, null, "pending", "auto-set on submission");
     }
 
+    await sendEmailNotification(env, payload as Record<string, unknown>, requestId);
+
     return jsonResponse(
       {
         message: "הבקשה נשמרה בהצלחה.",
@@ -863,6 +868,53 @@ async function logStatusChange(
   )
     .bind(requestId, fromStatus, toStatus, note)
     .run();
+}
+
+async function sendEmailNotification(env: Env, payload: Record<string, unknown>, requestId: string): Promise<void> {
+  // If email credentials are missing, skip silently to avoid blocking submission.
+  if (!env.RESEND_API_KEY) return;
+  const to = env.NOTIFY_EMAIL || "";
+  const toList = to.split(",").map((t) => t.trim()).filter(Boolean);
+  if (!toList.length) return;
+  const from = env.FROM_EMAIL || "no-reply@ashdod.muni.il";
+
+  const subject = `בקשה חדשה #${requestId}`;
+  const lines = [
+    `בקשה חדשה התקבלה.`,
+    `מחלקה: ${payload.department ?? ""}`,
+    `תיאור: ${payload.description ?? ""}`,
+    `עלות: ${payload.estimatedCost ?? ""}`,
+    `סטטוס: pending`,
+  ];
+
+  const bodyText = lines.join("\n");
+  const bodyHtml = `<p>בקשה חדשה התקבלה.</p><ul>
+    <li><strong>מחלקה:</strong> ${escapeHtml(String(payload.department ?? ""))}</li>
+    <li><strong>תיאור:</strong> ${escapeHtml(String(payload.description ?? ""))}</li>
+    <li><strong>עלות:</strong> ${escapeHtml(String(payload.estimatedCost ?? ""))}</li>
+    <li><strong>סטטוס:</strong> pending</li>
+    <li><strong>מזהה:</strong> ${escapeHtml(requestId)}</li>
+  </ul>`;
+
+  try {
+    await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from,
+        to: toList,
+        subject,
+        text: bodyText,
+        html: bodyHtml,
+      }),
+    });
+  } catch (err) {
+    // Non-blocking; log and continue.
+    console.error("Failed to send email", err);
+  }
 }
 
 async function handleAdminList(env: Env, url: URL): Promise<Response> {
