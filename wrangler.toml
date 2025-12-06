@@ -1,0 +1,14 @@
+name = "procurement-request-worker"
+main = "src/worker.ts"
+compatibility_date = "2024-07-01"
+account_id = "95ba6a62314a0682d0711050ba9c3445"
+
+[[d1_databases]]
+binding = "PROCUREMENT_DB"
+database_name = "procurement_requests"
+migrations_dir = "migrations"
+database_id = "cfc0c87a-316a-41c3-bb6a-a6371b06afa7"
+
+[[r2_buckets]]
+binding = "PROCUREMENT_FILES_BUCKET"
+bucket_name = "procurement-files"
