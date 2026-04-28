@@ -919,9 +919,11 @@ async function sendEmailNotification(env: Env, payload: Record<string, unknown>,
 
 async function handleAdminList(env: Env, url: URL): Promise<Response> {
   // TODO: replace with proper auth (e.g., Cloudflare Access/JWT/mTLS). Simple token check for now.
+  if (!env.ADMIN_TOKEN) {
+    return new Response("Server configuration error: ADMIN_TOKEN is not set.", { status: 500 });
+  }
   const adminToken = url.searchParams.get("adminToken");
-  const expected = env.ADMIN_TOKEN || "demo-admin-token";
-  if (!adminToken || adminToken !== expected) {
+  if (!adminToken || adminToken !== env.ADMIN_TOKEN) {
     return new Response("גישה נדחתה (נדרש טוקן ניהול).", { status: 403 });
   }
 
